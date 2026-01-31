@@ -1,4 +1,5 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useEffect, useRef, useState } from "react";
+import { EventSourcePolyfill } from "event-source-polyfill";
 
 export default function ChatBubble() {
   const [messages, setMessages] = useState([]);
@@ -7,6 +8,7 @@ export default function ChatBubble() {
   const [sessionInfo, setSessionInfo] = useState(null);
 
   const messagesEndRef = useRef(null);
+  const esRef = useRef(null); // keep reference for closing
 
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -14,115 +16,142 @@ export default function ChatBubble() {
 
   useEffect(scrollToBottom, [messages]);
 
+  // cleanup on unmount
+  useEffect(() => {
+    return () => {
+      if (esRef.current) {
+        esRef.current.close();
+        esRef.current = null;
+      }
+    };
+  }, []);
+
   const handleSend = async () => {
     if (!input.trim() || listening) return;
 
-    const userText = input;
+    const userText = input.trim();
     setInput("");
 
-    // add user msg
+    // add user message
     setMessages((prev) => [...prev, { sender: "user", text: userText }]);
 
-    // placeholder bot msg
+    // add bot placeholder message
     const botId = Date.now();
     setMessages((prev) => [...prev, { id: botId, sender: "bot", text: "" }]);
 
     setListening(true);
-    const token = localStorage.getItem("token"); // or "access_token"
+
+    // close old connection if any
+    if (esRef.current) {
+      esRef.current.close();
+      esRef.current = null;
+    }
+
+    const token = localStorage.getItem("token");
     if (!token) {
-        throw new Error("Token not found in localStorage. Please login again.");
-    } 
+      setListening(false);
+      alert("Token missing. Please login again.");
+      return;
+    }
+
+    // ✅ Read saved session id (if any)
+    const savedSessionId = localStorage.getItem("x_session_id") || "";
+
+    const url = `http://0.0.0.0:5050/agent/chat?message=${encodeURIComponent(
+      userText
+    )}`;
+
     try {
-      const res = await fetch("http://0.0.0.0:5050/agent/chat", {
-        method: "POST",
+      const es = new EventSourcePolyfill(url, {
         headers: {
-          "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
           Accept: "text/event-stream",
+
+          // ✅ Send session id back to BE
+          ...(savedSessionId ? { "x-session-id": savedSessionId } : {}),
         },
-        body: JSON.stringify({ message: userText }),
+        heartbeatTimeout: 120000, // 2 min
       });
 
-      if (!res.ok) {
-        throw new Error(`HTTP ${res.status}`);
-      }
+      esRef.current = es;
 
-      const reader = res.body.getReader();
-      const decoder = new TextDecoder("utf-8");
-
-      let buffer = "";
-
-      // SSE parser state
-      let currentEvent = "message";
-      let currentDataLines = [];
-
-      const flushEvent = () => {
-        if (!currentDataLines.length) return;
-
-        const rawData = currentDataLines.join("\n");
-
+      // ✅ SESSION EVENT
+      es.addEventListener("session", (e) => {
         try {
-          const parsed = JSON.parse(rawData);
+          const data = JSON.parse(e.data);
 
-          if (currentEvent === "session") {
-            setSessionInfo(parsed);
+          // update state
+          setSessionInfo(data);
+
+          // ✅ store session_id for next requests
+          if (data?.session_id) {
+            localStorage.setItem("x_session_id", data.session_id);
           }
 
-          if (currentEvent === "message") {
-            const chunk = parsed?.text ?? "";
-            setMessages((prev) =>
-              prev.map((m) =>
-                m.id === botId ? { ...m, text: (m.text || "") + chunk } : m
-              )
-            );
-          }
-
-          if (currentEvent === "done") {
-            setListening(false);
-          }
-
-          if (currentEvent === "error") {
-            console.error("Server error:", parsed);
-            setListening(false);
-          }
+          console.log("SESSION:", data);
         } catch (err) {
-          console.error("SSE JSON parse error:", err, rawData);
+          console.error("session parse error:", err, e.data);
         }
+      });
 
-        // reset for next event
-        currentEvent = "message";
-        currentDataLines = [];
+      // ✅ MESSAGE EVENT (stream chunks)
+      es.addEventListener("message", (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          const chunk = data?.text ?? "";
+
+          setMessages((prev) => {
+            const idx = prev.findIndex((m) => m.id === botId);
+            if (idx === -1) return prev;
+
+            const copy = [...prev];
+            copy[idx] = {
+              ...copy[idx],
+              text: (copy[idx].text || "") + chunk,
+            };
+            return copy;
+          });
+        } catch (err) {
+          console.error("message parse error:", err, e.data);
+        }
+      });
+
+      // ✅ DONE EVENT
+      es.addEventListener("done", (e) => {
+        console.log("DONE:", e.data);
+        setListening(false);
+
+        if (esRef.current) {
+          esRef.current.close();
+          esRef.current = null;
+        }
+      });
+
+      // ✅ ERROR EVENT (custom)
+      es.addEventListener("error", (e) => {
+        console.error("SSE error event:", e);
+
+        setListening(false);
+
+        if (esRef.current) {
+          esRef.current.close();
+          esRef.current = null;
+        }
+      });
+
+      // low-level onerror (network issues)
+      es.onerror = (err) => {
+        console.error("SSE connection error:", err);
+
+        setListening(false);
+
+        if (esRef.current) {
+          esRef.current.close();
+          esRef.current = null;
+        }
       };
-
-      while (true) {
-        const { value, done } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        // Split into SSE messages by blank line
-        const parts = buffer.split("\n\n");
-        buffer = parts.pop() || "";
-
-        for (const part of parts) {
-          const lines = part.split("\n");
-
-          for (const line of lines) {
-            if (line.startsWith("event:")) {
-              currentEvent = line.replace("event:", "").trim();
-            } else if (line.startsWith("data:")) {
-              currentDataLines.push(line.replace("data:", "").trim());
-            }
-          }
-
-          // one event completed
-          flushEvent();
-        }
-      }
-
-      setListening(false);
     } catch (err) {
-      console.error("Fetch SSE error:", err);
+      console.error("EventSourcePolyfill init error:", err);
       setListening(false);
     }
   };
@@ -130,7 +159,7 @@ export default function ChatBubble() {
   return (
     <div style={styles.chatWrapper}>
       <div style={styles.chatHeader}>
-        Equip🧠O
+        EquiMind 🧠
         {sessionInfo?.session_id ? (
           <div style={styles.sessionText}>Session: {sessionInfo.session_id}</div>
         ) : null}
@@ -172,8 +201,8 @@ const styles = {
     position: "fixed",
     bottom: 20,
     right: 20,
-    width: 320,
-    height: 420,
+    width: 340,
+    height: 440,
     background: "#fff",
     borderRadius: 12,
     boxShadow: "0 0 10px rgba(0,0,0,0.2)",
